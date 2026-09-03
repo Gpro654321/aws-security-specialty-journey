@@ -50,3 +50,8 @@ Both instances were attached to the "Lab-VPC".
 	What had happened is, once the target in the route table was modified, the output from the "public-ec2" could not reach my laptop, but the communication from my laptop was able to reach the instance. This happened because, modification in the route table did NOT affect the traffic going to the "public-subnet"(therefore my "pubic-ec2"), but since the traffic from the "public-subnet" was directed to the "public-ec2", i could not see the "success for the ssh".
 	This was better visualized when the "Lab-route-table" Target was modified whileI was pinging 8.8.8.8 after a successful login into the "public-ec2". The output stream froze in my terminal once the route table was misconfigured, again when the route table was configured back correctly, the output stream started scrolling again for the ping command.  
 
+
+### Tearing Down
+All that was created was manually deleted. 
+
+So this is where Terraform comes in handy. Creation and Deletion happens without me looking into the dependency of each service.
