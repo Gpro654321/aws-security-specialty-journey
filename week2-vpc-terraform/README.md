@@ -80,7 +80,7 @@ later weeks.
 
 - [x] VPC
 - [x] Public + private subnets
-- [ ] Internet Gateway + route table
-- [ ] Security group
-- [ ] EC2 instances
+- [x] Internet Gateway + route table
+- [x] Security group
+- [x] EC2 instances
 - [ ] Outputs for instance IPs

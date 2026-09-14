@@ -1,0 +1,82 @@
+# Debugging Log: SSM Session Manager Connectivity (Week 2 Lab)
+
+**Date:** [fill in today's date]
+**Context:** Terraform-automated VPC with public/private subnets, IAM role + instance profile for SSM-based access (no SSH by design)
+
+---
+
+## Objective
+
+Verify that both EC2 instances (public and private subnet) are reachable via AWS Systems Manager Session Manager, using an IAM role instead of SSH keys — confirming least-privilege, keyless access works as designed.
+
+---
+
+## Summary
+
+The public instance failed to register with SSM despite correct IAM permissions, correct security group rules, and correct networking. Root cause: **the SSM Agent was not pre-installed on the AMI used**, an assumption I'd carried over from older Amazon Linux 2 documentation that doesn't hold for this AL2023 image. Diagnosed via direct SSH access (using EC2 Instance Connect for a temporary key), fixed by installing the agent manually, then made the fix durable by adding it to `user_data` so any future instance self-installs it at boot with zero manual steps.
+
+---
+
+## Timeline of issues found and fixed, in order
+
+### 1. `TargetNotConnected` on first SSM connection attempt
+- **Symptom:** `aws ssm start-session` failed immediately; `aws ssm describe-instance-information` returned an empty list.
+- **Ruled out via direct verification, not assumption:** IAM role trust policy ✅, policy attachment (`AmazonSSMManagedInstanceCore`) ✅, instance profile attachment ✅, security group attachment ✅, VPC DNS support (`enableDnsSupport`) ✅, public IP assigned ✅.
+- **Lesson:** when several layers all check out independently and the symptom persists, that's a strong signal the problem is somewhere *not yet checked* — not a reason to keep re-verifying the same layers.
+
+### 2. Security group scoped too narrowly (443 only) — blocked DNS resolution
+- **Root cause:** egress limited to TCP/443 only. SSM Agent needs to *resolve* AWS's DNS names before it can connect — that requires port 53, which wasn't allowed.
+- **Fix:** added explicit egress rules for TCP/53 and UDP/53, alongside the existing TCP/443 rule.
+- **Lesson:** "least privilege" isn't just "narrow the obvious port" — it requires understanding every step of the actual connection sequence (DNS resolution happens *before* the HTTPS connection you're trying to allow).
+
+### 3. Needed to get inside the instance directly to diagnose further — no SSH key existed
+- Instance had no `key_name` set (deliberate, per the no-SSH design) and no pre-existing key pair.
+- **Used EC2 Instance Connect** to push a temporary (60-second) SSH key via the AWS API, rather than modifying the instance's launch configuration.
+- **Lesson:** EC2 Instance Connect is a genuinely useful temporary diagnostic tool that doesn't require baking permanent SSH access into infrastructure designed to avoid it.
+
+### 4. Instance Connect itself appeared to fail (`Permission denied`) on first two attempts
+- **Root cause: the 60-second validity window had expired** between running the "push key" command and the "connect" command as two separate steps.
+- **Fix:** chained both commands with `&&` in a single execution, eliminating the delay.
+- **Lesson:** time-boxed credentials (a recurring theme throughout this whole plan — SSO sessions, AssumeRole sessions, now Instance Connect) fail silently-but-predictably if you don't respect their expiry window. Always chain time-sensitive steps together rather than running them as separate, manually-paced actions.
+
+### 5. Root cause found: `amazon-ssm-agent.service could not be found`
+- Confirmed directly via `systemctl status amazon-ssm-agent` after finally getting shell access.
+- **This AL2023 AMI did not ship with the SSM Agent pre-installed** — an assumption inherited from general AL2-era documentation that didn't hold here.
+- **Fix (immediate):** `dnf install -y amazon-ssm-agent`, enabled and started the service manually.
+- **Fix (durable):** added the same three commands to the instance's `user_data`, so any future instance created from this Terraform config self-installs the agent at first boot — no manual SSH intervention required.
+
+### 6. Local tooling gap: `SessionManagerPlugin is not found`
+- After the agent was installed and registered correctly, `aws ssm start-session` still failed — this time from my **own machine**, not the instance.
+- **Root cause:** the AWS CLI needs a separate, locally-installed plugin (`session-manager-plugin`) specifically to handle SSM's interactive session streaming.
+- **Fix:** installed the plugin via the official `.deb` package.
+- **Lesson:** not every failure is on the AWS side — client-side tooling gaps look identical to server-side ones until you check which side the error is actually coming from.
+
+### 7. Verified the durable fix by tearing down and rebuilding from scratch
+- `terraform destroy` → `terraform apply` with `user_data` now in place.
+- Confirmed via `aws ssm describe-instance-information` that the new instance registered **without any manual SSH or installation step**.
+- **This is the actual proof the fix was captured in code, not just patched by hand once.**
+
+---
+
+## Known, deliberately deferred gap
+
+**Private subnet instance still cannot reach SSM** — by design, it has no internet route, so its (now correctly installed) SSM Agent has no path to Systems Manager's endpoints. The fix requires three Interface VPC Endpoints (`ssm`, `ssmmessages`, `ec2messages`) associated with the private subnet, using AWS's private network path instead of the internet. Not yet implemented — planned for the next session, along with a genuine design question still to resolve: whether the endpoints should share the existing instance security group or use a dedicated one, given they need to *accept* inbound HTTPS rather than only send outbound traffic.
+
+---
+
+## Key takeaways worth remembering
+
+1. **"IAM role exists" is not the same as "IAM role does something."** Three separate resources — role, policy attachment, instance profile — each answer a genuinely different question (who's trusted / what can they do / how does it physically attach), and a gap in any one produces a different, distinguishable failure mode.
+2. **Least privilege requires understanding the full connection sequence**, not just the "obvious" port. DNS resolution before HTTPS is a good general example of a step that's easy to forget when scoping egress rules.
+3. **Time-boxed credentials fail in a specific, recognizable way** — a clean rejection after a working handshake, not a network-level failure. Recognizing this pattern (successful TCP/SSH negotiation, then rejection) is itself diagnostic information.
+4. **A fix isn't done until it survives a full teardown and rebuild.** Manually patching a running resource proves the *symptom* can be fixed; only a from-scratch rebuild proves the *root cause* was actually addressed in code.
+5. **Don't assume AMI defaults carry over across versions.** Documentation and tutorials often reflect an older AMI generation's behavior (AL2) that doesn't automatically hold for the current one (AL2023) — worth verifying directly rather than assuming.
+
+---
+
+## Self-check questions (answer without looking back, before next session)
+
+- Why does a security group scoped to only the "final" port of a connection sometimes still block that connection entirely?
+- Why is EC2 Instance Connect a better diagnostic tool here than adding a permanent SSH key pair?
+- What's the actual proof that a fix is captured in code rather than just patched by hand?
+- Why does the private instance's problem require a fundamentally different fix (VPC Endpoints) than anything used to solve the public instance's problem?
